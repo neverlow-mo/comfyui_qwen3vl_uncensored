@@ -1,0 +1,260 @@
+import os
+import random
+import tempfile
+from typing import List, Optional
+
+import torch
+import numpy as np
+from PIL import Image
+
+from .llama_wrapper import LlamaWrapper
+from .prompts_config import PRESET_PROMPTS, PRESET_TOKEN_DEFAULTS
+
+
+MAX_I32 = 2**31 - 1
+
+
+def _tensor_to_pil_rgb(t: torch.Tensor) -> Image.Image:
+    """
+    Expect ComfyUI IMAGE tensor: [H,W,C] float 0..1 (or uint8)
+    """
+    if isinstance(t, np.ndarray):
+        t = torch.from_numpy(t)
+    if t.dtype != torch.uint8:
+        t = (t.clamp(0, 1) * 255.0).to(torch.uint8)
+    arr = t.cpu().numpy()
+    if arr.ndim == 2:
+        arr = np.stack([arr, arr, arr], axis=-1)
+    if arr.shape[-1] == 4:
+        arr = arr[..., :3]
+    return Image.fromarray(arr, mode="RGB")
+
+
+def _sample_video_frames(video: torch.Tensor, frame_count: int) -> List[torch.Tensor]:
+    """
+    GGUF-style: video is IMAGE tensor; if ndim==4 treat first dim as frames.
+    """
+    if video is None:
+        return []
+    if isinstance(video, np.ndarray):
+        video = torch.from_numpy(video)
+    if video.ndim != 4:
+        return [video]
+    total = int(video.shape[0])
+    frame_count = max(int(frame_count), 1)
+    if total <= frame_count:
+        return [video[i] for i in range(total)]
+    idx = np.linspace(0, total - 1, frame_count, dtype=int)
+    return [video[i] for i in idx]
+
+
+def _make_contact_sheet(frames: List[Image.Image], cell_size: int = 512) -> Image.Image:
+    """
+    Create a simple grid montage from frames (single image output for llama.cpp).
+    """
+    if not frames:
+        raise ValueError("No frames to build contact sheet")
+
+    # Normalize to same size
+    norm = []
+    for im in frames:
+        im = im.convert("RGB")
+        im = im.resize((cell_size, cell_size), Image.BICUBIC)
+        norm.append(im)
+
+    n = len(norm)
+    cols = int(np.ceil(np.sqrt(n)))
+    rows = int(np.ceil(n / cols))
+
+    sheet = Image.new("RGB", (cols * cell_size, rows * cell_size), (0, 0, 0))
+    for i, im in enumerate(norm):
+        r = i // cols
+        c = i % cols
+        sheet.paste(im, (c * cell_size, r * cell_size))
+    return sheet
+
+
+def _save_temp_png(pil_img: Image.Image) -> str:
+    fd, path = tempfile.mkstemp(prefix="qwen3vl_video_", suffix=".png")
+    os.close(fd)
+    pil_img.save(path, format="PNG")
+    return path
+
+
+class Qwen3VLPromptGenerator:
+    @classmethod
+    def INPUT_TYPES(cls):
+        prompts = PRESET_PROMPTS or [
+            "🖼️ Tags",
+            "🖼️ Simple Description",
+            "🖼️ Detailed Description",
+            "🖼️ Ultra Detailed Description",
+            "🎬 Cinematic Description",
+            "🖼️ Detailed Analysis",
+            "📹 Video Summary",
+            "📖 Short Story",
+            "🪄 Prompt Refine & Expand",
+        ]
+        default_prompt = "🖼️ Detailed Analysis" if "🖼️ Detailed Analysis" in prompts else prompts[0]
+        default_tokens = int(PRESET_TOKEN_DEFAULTS.get(default_prompt, 700))
+
+
+        return {
+            "required": {
+                "mode": (["enhance", "describe", "multimodal"], {"default": "enhance"}),
+                "text": ("STRING", {"default": "", "multiline": True}),
+                "temperature": ("FLOAT", {"default": 0.7, "min": 0.0, "max": 2.0, "step": 0.05}),
+                "max_tokens": ("INT", {"default": default_tokens, "min": 16, "max": 4096, "step": 16}),
+                "preset_prompt": (prompts, {"default": default_prompt}),
+                "use_preset_tokens": ("BOOLEAN", {"default": True}),
+                "seed": ("INT", {"default": 1, "min": 1, "max": MAX_I32}),
+                "control_after_generate": (["fixed", "increment", "decrement", "randomize"], {"default": "randomize"}),
+                "keep_model_loaded": ("BOOLEAN", {"default": True}),
+                "frame_count": ("INT", {"default": 16, "min": 1, "max": 64}),
+            },
+            "optional": {
+                "image": ("IMAGE",),
+                "video": ("IMAGE",),
+            }
+        }
+
+    RETURN_TYPES = ("STRING", "INT")
+    RETURN_NAMES = ("generated_prompt", "seed")
+    FUNCTION = "generate_prompt"
+    CATEGORY = "prompt/qwen3vl"
+
+    def __init__(self):
+        self.llama = None
+
+    def _ensure_llama(self):
+        if self.llama is None:
+            self.llama = LlamaWrapper()
+            print("[Qwen3-VL] ✅ LlamaWrapper initialisiert")
+
+    def _next_seed(self, seed: int, control: str) -> int:
+        control = (control or "randomize").strip().lower()
+        if control == "fixed":
+            return int(seed)
+        if control == "increment":
+            return int(seed) + 1
+        if control == "decrement":
+            return int(seed) - 1
+        # randomize
+        return random.randint(1, MAX_I32)
+
+    def _video_to_image_path(self, video: torch.Tensor, frame_count: int) -> Optional[str]:
+        frames_t = _sample_video_frames(video, frame_count)
+        if not frames_t:
+            return None
+        frames = [_tensor_to_pil_rgb(ft) for ft in frames_t]
+        # Contact sheet => single image for llama
+        sheet = _make_contact_sheet(frames, cell_size=512)
+        return _save_temp_png(sheet)
+
+    def generate_prompt(
+        self,
+        mode: str,
+        text: str = "",
+        temperature: float = 0.7,
+        max_tokens: int = 400,
+        preset_prompt: str = "🖼️ Detailed Analysis",
+        use_preset_tokens: bool = True,
+        seed: int = 1,
+        control_after_generate: str = "randomize",
+        keep_model_loaded: bool = True,
+        frame_count: int = 16,
+        image=None,
+        video=None,
+    ):
+        self._ensure_llama()
+
+        # clamp seed to int32 range (ComfyUI validation)
+        seed = int(seed)
+        seed = max(1, min(seed, MAX_I32))
+        next_seed = self._next_seed(seed, control_after_generate)
+
+        # token preset overrides (optional)
+        n_predict = PRESET_TOKEN_DEFAULTS.get(preset_prompt, 700) if use_preset_tokens else None
+        # max_tokens wins if user explicitly sets it lower/higher
+        if max_tokens is not None:
+            n_predict = int(max_tokens)
+
+        tmp_video_png = None
+        try:
+            # Build an image_path if image/video is given
+            image_path = None
+            if image is not None:
+                # ComfyUI IMAGE typically batch=1 => [1,H,W,C]
+                if hasattr(image, "ndim") and image.ndim == 4:
+                    img_t = image[0]
+                else:
+                    img_t = image
+                pil = _tensor_to_pil_rgb(img_t)
+                image_path = _save_temp_png(pil)
+
+            elif video is not None:
+                tmp_video_png = self._video_to_image_path(video, frame_count)
+                image_path = tmp_video_png
+
+            # Run
+            if mode == "enhance":
+                print(f"[Qwen3-VL] Enhancing text: '{(text or '')[:24]}...'")
+                out = self.llama.enhance_prompt(
+                    text=text or "",
+                    preset_prompt=preset_prompt,
+                    use_preset_tokens=use_preset_tokens,
+                    seed=seed,
+                )
+
+            elif mode == "describe":
+                if not image_path:
+                    return ("❌ ERROR: describe braucht image oder video.", next_seed)
+                print(f"[Qwen3-VL] Describing image/video -> {image_path}")
+                out = self.llama.describe_image(
+                    image_path=image_path,
+                    preset_prompt=preset_prompt,
+                    use_preset_tokens=use_preset_tokens,
+                    seed=seed,
+                )
+
+            else:  # multimodal
+                if not image_path:
+                    return ("❌ ERROR: multimodal braucht image oder video.", next_seed)
+                print(f"[Qwen3-VL] Multimodal: text+image/video")
+                out = self.llama.multimodal_enhance(
+                    text=text or "",
+                    image_path=image_path,
+                    preset_prompt=preset_prompt,
+                    use_preset_tokens=use_preset_tokens,
+                    seed=seed,
+                )
+
+            if not keep_model_loaded:
+                try:
+                    self.llama.clear()
+                except Exception:
+                    pass
+
+            if out:
+                print(f"[Qwen3-VL] Generated prompt ({len(out)} chars)")
+            return (out or "", next_seed)
+
+        except Exception as e:
+            return (f"❌ ERROR in {mode} mode:\n{e}", next_seed)
+
+        finally:
+            # cleanup temp files
+            try:
+                if tmp_video_png and os.path.exists(tmp_video_png):
+                    os.remove(tmp_video_png)
+            except Exception:
+                pass
+
+
+NODE_CLASS_MAPPINGS = {
+    "Qwen3VLPromptGenerator": Qwen3VLPromptGenerator,
+}
+
+NODE_DISPLAY_NAME_MAPPINGS = {
+    "Qwen3VLPromptGenerator": "Qwen3-VL Prompt Generator (Uncensored)",
+}

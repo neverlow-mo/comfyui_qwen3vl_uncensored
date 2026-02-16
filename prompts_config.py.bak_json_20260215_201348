@@ -1,0 +1,74 @@
+from __future__ import annotations
+from pathlib import Path
+import json
+
+HERE = Path(__file__).resolve().parent
+PROMPTS_JSON = HERE / "system_prompts.json"
+
+# Fallbacks (falls JSON fehlt/kaputt ist)
+FALLBACK_PRESETS = [
+    "📝 Enhance",
+    "📝 Refine",
+    "📝 Creative Rewrite",
+    "📝 Detailed Visual",
+    "📝 Artistic Style",
+    "📝 Technical Specs",
+]
+
+# Optionale Token-Defaults (du kannst später in system_prompts.json selbst ergänzen)
+# Format-Idee:
+# "qwen_text": { "token_defaults": { "📝 Enhance": 700, ... } }
+FALLBACK_TOKEN_DEFAULTS = {
+    "📝 Enhance": 700,
+    "📝 Refine": 450,
+    "📝 Creative Rewrite": 650,
+    "📝 Detailed Visual": 750,
+    "📝 Artistic Style": 750,
+    "📝 Technical Specs": 550,
+}
+
+def load_prompts() -> tuple[list[str], dict[str, str], dict[str, int]]:
+    """
+    Returns:
+      presets: list of preset names for dropdown
+      system_prompts: mapping preset -> system_prompt string
+      token_defaults: mapping preset -> max_tokens default (optional)
+    """
+    if not PROMPTS_JSON.exists():
+        return FALLBACK_PRESETS, {}, dict(FALLBACK_TOKEN_DEFAULTS)
+
+    try:
+        data = json.loads(PROMPTS_JSON.read_text(encoding="utf-8", errors="replace"))
+    except Exception:
+        return FALLBACK_PRESETS, {}, dict(FALLBACK_TOKEN_DEFAULTS)
+
+    # We use the qwen_text.styles section (AILab style prompts)
+    qwen_text = (data or {}).get("qwen_text") or {}
+    styles = qwen_text.get("styles") or {}
+
+    # Build presets list from JSON keys (stable order if present)
+    presets = list(styles.keys()) if styles else []
+    if not presets:
+        presets = list((data or {}).get("_preset_prompts") or [])
+    if not presets:
+        presets = list(FALLBACK_PRESETS)
+
+    system_prompts: dict[str, str] = {}
+    for k, v in (styles or {}).items():
+        sp = (v or {}).get("system_prompt")
+        if isinstance(sp, str) and sp.strip():
+            system_prompts[k] = sp.strip()
+
+    token_defaults = dict(FALLBACK_TOKEN_DEFAULTS)
+    td = (qwen_text.get("token_defaults") or {})
+    if isinstance(td, dict):
+        for k, v in td.items():
+            try:
+                token_defaults[str(k)] = int(v)
+            except Exception:
+                pass
+
+    return presets, system_prompts, token_defaults
+
+# Module-level cached values (fast, no repeated disk reads)
+PRESET_PROMPTS, SYSTEM_PROMPTS, PRESET_TOKEN_DEFAULTS = load_prompts()

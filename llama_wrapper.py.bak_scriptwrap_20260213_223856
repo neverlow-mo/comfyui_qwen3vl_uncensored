@@ -1,0 +1,333 @@
+import os
+import re
+import subprocess
+import time
+from pathlib import Path
+
+from . import config
+
+# --- QwenVL(GGUF)-style preset prompts (ported) ---
+PRESET_TOKEN_DEFAULTS = {
+    "🖼️ Tags": 128,
+    "🖼️ Simple Description": 256,
+    "🖼️ Detailed Description": 512,
+    "🖼️ Ultra Detailed Description": 900,
+    "🎬 Cinematic Description": 700,
+    "🖼️ Detailed Analysis": 700,
+    "📹 Video Summary": 512,
+    "📖 Short Story": 800,
+    "🪄 Prompt Refine & Expand": 700,
+}
+
+
+def build_system_prompt(mode: str, preset: str) -> str:
+    """
+    mode: enhance / describe / multimodal
+    preset: one of the UI strings (ported from ComfyUI-QwenVL)
+    """
+    preset = (preset or "🖼️ Detailed Analysis").strip()
+
+    if preset == "🖼️ Tags":
+        if mode in ("describe", "multimodal"):
+            return "You are a vision assistant. Output concise comma-separated tags that describe the image. Output ONLY tags."
+        return "You are a helpful assistant that outputs concise comma-separated tags for image generation. Output ONLY tags."
+
+    if preset == "🖼️ Simple Description":
+        return "You are a vision assistant. Describe the image simply and clearly in 1-2 sentences. Output ONLY the description."
+
+    if preset == "🖼️ Detailed Description":
+        return "You are a vision assistant. Describe the image in rich, concrete detail (subjects, clothing, lighting, composition, background, mood). Output ONLY the description."
+
+    if preset == "🖼️ Ultra Detailed Description":
+        return ("You are a vision assistant. Produce an ultra-detailed description including: subject(s), environment, "
+                "lighting, camera angle, composition, textures, colors, mood, and notable small details. Output ONLY the description.")
+
+    if preset == "🎬 Cinematic Description":
+        return "You are a vision assistant. Describe the image cinematically: lighting, lens, framing, atmosphere, and storytelling cues. Output ONLY the description."
+
+    if preset == "📹 Video Summary":
+        return "You are a vision assistant. Summarize the visual content as if it were a short video scene: main action, setting, and key details in a concise paragraph. Output ONLY the summary."
+
+    if preset == "📖 Short Story":
+        return ("You are a creative assistant. Write a short, vivid micro-story inspired by the image and/or user text. "
+                "Keep it concrete and visual. Output ONLY the story.")
+
+    if preset == "🪄 Prompt Refine & Expand":
+        return ("You are a prompt engineer for image generation. Take the user text (and image if provided) and produce "
+                "one refined, expanded prompt with concrete visual details (subject, setting, lighting, style cues) "
+                "without extra commentary. Output ONLY the final enhanced prompt.")
+
+    # default / "🖼️ Detailed Analysis"
+    if mode == "multimodal":
+        return ("You are a helpful multimodal assistant. Given the image and the user text, produce a single enhanced "
+                "image-generation prompt that is faithful to the image. Output ONLY the final enhanced prompt.")
+    if mode == "enhance":
+        return ("You are a helpful assistant that writes high-quality, detailed prompts for image generation. "
+                "Rewrite and enhance the user prompt into a single, vivid image-generation prompt. Output ONLY the final enhanced prompt.")
+    return "You are a vision assistant. Describe the image in rich, concrete detail. Output ONLY the description."
+
+
+class LlamaWrapper:
+    """
+    llama.cpp wrapper (llama-cli via subprocess)
+
+    Handles:
+    - stdout/stderr being inconsistent (some builds print everything to stderr)
+    - output written to controlling TTY (/dev/tty), which bypasses PIPE capture
+
+    Strategy:
+    1) Try normal PIPE capture (stdout+stderr)
+    2) If empty or missing the answer, fall back to controlling PTY (pty.fork)
+    3) Extract answer robustly: take block after last \"> \" prompt-echo until \"[ Prompt:\" / \"Exiting...\"
+    4) Clean ANSI/control chars/garbage prefixes
+    """
+
+    def __init__(self):
+        self.llama_cli: Path = config.LLAMA_CLI
+        self.model: Path = config.MODEL_PATH
+        self.mmproj: Path = config.MMPROJ_PATH
+
+        if not self.llama_cli.exists():
+            raise FileNotFoundError("llama-cli nicht gefunden")
+        if not self.model.exists():
+            raise FileNotFoundError(f"Modell nicht gefunden: {self.model}")
+
+    def _build_cmd(self, full_prompt: str, image_path: str | None = None, n_predict: int | None = None, seed: int | None = None) -> list[str]:
+        cmd = [
+            str(self.llama_cli),
+            "-m", str(self.model),
+            "-st",
+            "-p", full_prompt,
+            "-c", "8192",
+            "-ngl", "99",
+        ]
+        if n_predict is not None:
+            cmd.extend(["--n-predict", str(int(n_predict))])
+
+        if seed is not None:
+            cmd.extend(["--seed", str(int(seed))])
+
+        if image_path and self.mmproj.exists():
+            cmd.extend(["--mmproj", str(self.mmproj), "--image", str(image_path)])
+        return cmd
+
+    def _run_pipes(self, cmd: list[str]) -> str:
+        result = subprocess.run(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=180,
+            check=True,
+        )
+        out = (result.stdout or "").strip("\n")
+        err = (result.stderr or "").strip("\n")
+        return "\n".join([s for s in (out, err) if s]).strip()
+
+    def _run_controlling_pty(self, cmd: list[str]) -> str:
+        """
+        Run command with a *controlling* PTY using pty.fork().
+        Captures output even if the program writes to /dev/tty.
+        """
+        import pty
+        import select
+
+        pid, fd = pty.fork()
+        if pid == 0:
+            try:
+                os.execvp(cmd[0], cmd)
+            except Exception:
+                os._exit(127)
+
+        chunks: list[bytes] = []
+        start = time.time()
+        timeout = 180
+
+        try:
+            while True:
+                if time.time() - start > timeout:
+                    try:
+                        os.kill(pid, 9)
+                    except OSError:
+                        pass
+                    raise subprocess.TimeoutExpired(cmd, timeout)
+
+                r, _, _ = select.select([fd], [], [], 0.25)
+                if r:
+                    try:
+                        data = os.read(fd, 65536)
+                    except OSError:
+                        data = b""
+                    if data:
+                        chunks.append(data)
+
+                # exited?
+                try:
+                    wpid, _ = os.waitpid(pid, os.WNOHANG)
+                except ChildProcessError:
+                    wpid = pid
+
+                if wpid == pid:
+                    # drain
+                    for _ in range(20):
+                        r, _, _ = select.select([fd], [], [], 0.05)
+                        if not r:
+                            break
+                        try:
+                            data = os.read(fd, 65536)
+                        except OSError:
+                            break
+                        if not data:
+                            break
+                        chunks.append(data)
+                    break
+
+            raw = b"".join(chunks)
+            return raw.decode("utf-8", errors="replace").strip()
+        finally:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+
+    def _extract_answer(self, text: str) -> str:
+        if not text:
+            return ""
+
+        lines = text.splitlines()
+
+        # cut footer
+        stop_idx = len(lines)
+        for i, line in enumerate(lines):
+            if re.match(r"^\s*\[\s*Prompt\s*:", line, re.IGNORECASE):
+                stop_idx = i
+                break
+            if re.match(r"^\s*Exiting\.\.\.\s*$", line, re.IGNORECASE):
+                stop_idx = i
+                break
+        lines = lines[:stop_idx]
+
+        # find last prompt echo
+        last_prompt = -1
+        for i, line in enumerate(lines):
+            if line.lstrip().startswith("> "):
+                last_prompt = i
+
+        candidate = lines[last_prompt + 1 :] if last_prompt >= 0 else lines
+
+        cleaned: list[str] = []
+        for raw in candidate:
+            line = raw.rstrip("\r")
+            s = line.strip()
+            if not s:
+                continue
+
+            # ASCII art / banner-ish
+            if "▄▄" in line or "▀▀" in line or "████" in line:
+                continue
+
+            # internal logs
+            if s.startswith("llama_") or s.startswith("ggml_"):
+                continue
+            if "compute capability" in s or "GeForce" in s:
+                continue
+            low = s.lower()
+            if low.startswith("build") or low.startswith("model") or low.startswith("modalities"):
+                continue
+            if low.startswith("available commands:"):
+                continue
+            if low.startswith("/exit") or low.startswith("/regen") or low.startswith("/clear") or low.startswith("/read") or low.startswith("/image"):
+                continue
+
+            # echoed prompt marker
+            if s.startswith("> "):
+                continue
+
+            cleaned.append(line)
+
+        ans = "\n".join(cleaned).strip()
+
+        # strip ANSI color codes (basic + robust CSI)
+        ans = re.sub(r"\x1b\[[0-9;]*[A-Za-z]", "", ans)  # basic
+        ans = re.sub(r"\x1b\[[0-9;?]*[ -/]*[@-~]", "", ans)  # robust CSI
+        ans = re.sub(r"\uFFFD\[[0-9;?]*[ -/]*[@-~]", "", ans)  # replacement-char variants
+
+        # strip control chars (keep \n and \t)
+        ans = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]", "", ans)
+
+        # normalize literal "\n" sequences if any survived
+        ans = ans.replace("\r", "")
+        ans = ans.replace("\\n", "\n").strip()
+
+        # strip leading garbage that may survive PTY capture
+        ans = re.sub(r"^\s*[^A-Za-z0-9\(\[\"\'#]+", "", ans).strip()
+
+        # ---- output cleanup (make it GGUF-like: final prompt only) ----
+        ans = ans.lstrip()
+        ans = re.sub(r"\|?FETCH ComfyRegistry Data:[^\n]*", "", ans)
+        ans = re.sub(r"\|?FETCH DATA from:[^\n]*", "", ans)
+        ans = ans.replace("FETCH ComfyRegistry Data [DONE]", "")
+        ans = ans.replace("[ComfyUI-Manager] All startup tasks have been completed.", "")
+        ans = re.sub(r"\s{2,}", " ", ans)  # collapse ugly double spaces from removals
+        if ans.startswith("|-"):
+            ans = ans[2:].lstrip()
+        bad_prefixes = (
+            "User prompt:", "Output ONLY", "You are a ", "You are an ", "Rewrite and enhance",
+            "Given the image", "Describe the image", "> ",
+        )
+        clean = []
+        for ln in ans.splitlines():
+            s = ln.strip()
+            if not s:
+                continue
+            if s.startswith(bad_prefixes):
+                continue
+            clean.append(ln)
+        ans = "\n".join(clean).strip()
+        # ---------------------------------------------------------------
+        return ans
+
+    def _run_llama(self, full_prompt: str, image_path: str | None = None, n_predict: int | None = None, seed: int | None = None) -> str:
+        cmd = self._build_cmd(full_prompt, image_path=image_path, n_predict=n_predict, seed=seed)
+
+        combined = ""
+        try:
+            combined = self._run_pipes(cmd)
+        except subprocess.TimeoutExpired:
+            return "❌ ERROR: llama-cli Timeout (pipes)."
+        except subprocess.CalledProcessError as e:
+            out = (e.stdout or "").strip()
+            err = (e.stderr or "").strip()
+            combined = "\n".join([s for s in (out, err) if s]).strip()
+
+        ans = self._extract_answer(combined)
+
+        if not ans:
+            try:
+                combined = self._run_controlling_pty(cmd)
+            except subprocess.TimeoutExpired:
+                return "❌ ERROR: llama-cli Timeout (pty)."
+            except Exception as e:
+                return f"❌ ERROR: PTY capture failed: {e}"
+            ans = self._extract_answer(combined)
+
+        return ans
+
+    # Public API expected by qwen3vl_node.py
+    def enhance_prompt(self, text: str, preset_prompt: str = "🖼️ Detailed Analysis", use_preset_tokens: bool = True, seed: int | None = None) -> str:
+        system_prompt = build_system_prompt("enhance", preset_prompt)
+        full_prompt = f"{system_prompt}\nUser prompt: {text}\nOutput ONLY the final enhanced prompt."
+        n_predict = PRESET_TOKEN_DEFAULTS.get(preset_prompt, 700) if use_preset_tokens else None
+        return self._run_llama(full_prompt, n_predict=n_predict, seed=seed)
+
+    def describe_image(self, image_path: str, preset_prompt: str = "🖼️ Detailed Analysis", use_preset_tokens: bool = True, seed: int | None = None) -> str:
+        system_prompt = build_system_prompt("describe", preset_prompt)
+        full_prompt = f"{system_prompt}"
+        n_predict = PRESET_TOKEN_DEFAULTS.get(preset_prompt, 700) if use_preset_tokens else None
+        return self._run_llama(full_prompt, image_path=image_path, n_predict=n_predict, seed=seed)
+
+    def multimodal_enhance(self, text: str, image_path: str, preset_prompt: str = "🖼️ Detailed Analysis", use_preset_tokens: bool = True, seed: int | None = None) -> str:
+        system_prompt = build_system_prompt("multimodal", preset_prompt)
+        full_prompt = f"{system_prompt}\nUser text: {text}\nOutput ONLY the final enhanced prompt."
+        n_predict = PRESET_TOKEN_DEFAULTS.get(preset_prompt, 700) if use_preset_tokens else None
+        return self._run_llama(full_prompt, image_path=image_path, n_predict=n_predict, seed=seed)

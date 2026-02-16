@@ -1,0 +1,162 @@
+import subprocess
+import re
+from pathlib import Path
+
+from . import config
+
+
+class LlamaWrapper:
+    """
+    llama.cpp wrapper (llama-cli via subprocess)
+
+    Key fix:
+    - llama-cli prints a lot (often ALL) content to stderr.
+    - therefore we ALWAYS parse from combined (stdout + stderr).
+    """
+
+    def __init__(self):
+        self.llama_cli: Path = config.LLAMA_CLI
+        self.model: Path = config.MODEL_PATH
+        self.mmproj: Path = config.MMPROJ_PATH
+
+        if not self.llama_cli.exists():
+            raise FileNotFoundError("llama-cli nicht gefunden")
+        if not self.model.exists():
+            raise FileNotFoundError(f"Modell nicht gefunden: {self.model}")
+
+    def _run_llama(self, full_prompt: str, image_path: str | None = None) -> str:
+        cmd = [
+            str(self.llama_cli),
+            "-m", str(self.model),
+            "-st",  # single-turn, avoids interactive chat mode
+            "-p", full_prompt,
+            "-c", "8192",
+            "-ngl", "99",
+        ]
+
+        if image_path and self.mmproj.exists():
+            cmd.extend(["--mmproj", str(self.mmproj), "--image", str(image_path)])
+
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=180,
+            check=True,
+        )
+
+        # IMPORTANT: parse from combined stream (stderr often contains the actual answer)
+        out = (result.stdout or "").strip("\n")
+        err = (result.stderr or "").strip("\n")
+        combined = "\n".join([s for s in (out, err) if s]).strip()
+
+        return self._extract_answer(combined)
+
+    def _extract_answer(self, text: str) -> str:
+        """
+        Extract "just the assistant answer" from llama-cli combined output.
+
+        Strategy:
+        - Remove banners / metadata lines
+        - Stop at perf footer like: [ Prompt: ... ] and at "Exiting..."
+        - Remove the echoed user prompt line starting with "> "
+        - Keep actual answer lines (including bullets starting with "-")
+        """
+
+        if not text:
+            return ""
+
+        lines = text.splitlines()
+
+        cleaned: list[str] = []
+        in_commands_block = False
+
+        stop_patterns = [
+            re.compile(r"^\s*\[\s*Prompt\s*:", re.IGNORECASE),
+            re.compile(r"^\s*Exiting\.\.\.\s*$", re.IGNORECASE),
+        ]
+
+        drop_prefixes = (
+            "build",
+            "model",
+            "modalities",
+            "available commands:",
+        )
+
+        for raw in lines:
+            line = raw.rstrip("\r")
+
+            # hard stop (perf/footer)
+            if any(p.search(line) for p in stop_patterns):
+                break
+
+            s = line.strip()
+
+            # skip empty
+            if not s:
+                continue
+
+            # skip command help block
+            if s.lower() == "available commands:":
+                in_commands_block = True
+                continue
+            if in_commands_block:
+                # stop skipping when the prompt echo begins
+                if s.startswith("> "):
+                    in_commands_block = False
+                else:
+                    continue
+
+            # skip the big ascii banner blocks (very rough but safe)
+            if "▄▄" in line or "▀▀" in line or "████" in line:
+                continue
+
+            # skip device / ggml / llama internal logs
+            if s.startswith("llama_") or s.startswith("ggml_") or "compute capability" in s or "GeForce" in s:
+                continue
+
+            # skip header-ish lines
+            low = s.lower()
+            if any(low.startswith(p) for p in drop_prefixes):
+                continue
+
+            # skip echoed user prompt (single-turn usually shows "> ...")
+            if s.startswith("> "):
+                continue
+
+            # skip the interactive input prompt marker
+            if s == ">":
+                continue
+
+            cleaned.append(line)
+
+        # Final cleanup: collapse excessive blank lines (already stripped) and return
+        answer = "\n".join(cleaned).strip()
+
+        return answer
+
+    # Public API expected by qwen3vl_node.py
+    def enhance_prompt(self, text: str) -> str:
+        full_prompt = (
+            "You are a helpful assistant that writes high-quality, detailed prompts for image generation.\n"
+            "Rewrite and enhance the user prompt into a single, vivid image-generation prompt.\n"
+            f"User prompt: {text}\n"
+            "Output ONLY the final enhanced prompt."
+        )
+        return self._run_llama(full_prompt)
+
+    def describe_image(self, image_path: str) -> str:
+        full_prompt = (
+            "You are a vision assistant. Describe the image in rich, concrete detail.\n"
+            "Output ONLY the description."
+        )
+        return self._run_llama(full_prompt, image_path=image_path)
+
+    def multimodal_enhance(self, text: str, image_path: str) -> str:
+        full_prompt = (
+            "You are a helpful multimodal assistant.\n"
+            "Given the image and the user text, produce a single enhanced image-generation prompt.\n"
+            f"User text: {text}\n"
+            "Output ONLY the final enhanced prompt."
+        )
+        return self._run_llama(full_prompt, image_path=image_path)

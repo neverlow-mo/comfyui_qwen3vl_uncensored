@@ -1,0 +1,65 @@
+"""Qwen3-VL Uncensored - FINAL"""
+import subprocess, re
+from pathlib import Path
+from typing import Optional
+from . import config
+
+class LlamaWrapper:
+    def __init__(self):
+        self.llama_cli = config.LLAMA_CLI
+        self.model = config.MODEL_PATH
+        self.mmproj = config.MMPROJ_PATH
+        if not self.llama_cli.exists():
+            raise FileNotFoundError(f"llama-cli nicht gefunden")
+        if not self.model.exists():
+            raise FileNotFoundError(f"Modell nicht gefunden")
+    
+    def generate(self, prompt: str, image_path: Optional[Path] = None, 
+                 system_prompt: Optional[str] = None, max_tokens: int = config.MAX_TOKENS,
+                 temperature: float = config.TEMPERATURE) -> str:
+        if system_prompt:
+            full_prompt = f"{system_prompt}\n\nUser: {prompt}\n\nAssistant:"
+        else:
+            full_prompt = prompt
+        
+        cmd = [str(self.llama_cli), "-m", str(self.model), "-p", full_prompt,
+               "-n", str(max_tokens), "-ngl", str(config.N_GPU_LAYERS),
+               "-c", str(config.CONTEXT_SIZE), "--temp", str(temperature), "-st"]
+        
+        if image_path and self.mmproj.exists():
+            cmd.extend(["--mmproj", str(self.mmproj), "--image", str(image_path)])
+        
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=120, check=True)
+            
+            # Nutze REGEX: Alles nach "Assistant:" bis vor "["
+            match = re.search(r'Assistant:\s*(.*?)\s*\[', result.stdout, re.DOTALL)
+            if match:
+                response = match.group(1).strip()
+                print(f"[Qwen3-VL] ✅ Generated {len(response)} chars")
+                return response
+            else:
+                # Fallback: Nimm stdout ohne Performance-Zeile
+                lines = [l for l in result.stdout.split('\n') 
+                        if l.strip() and not ('[ Prompt:' in l and 't/s' in l) and l.strip() != 'Exiting...']
+                response = '\n'.join(lines).strip()
+                print(f"[Qwen3-VL] ⚠️ Fallback: {len(response)} chars")
+                return response if response else "❌ ERROR: Empty"
+        except Exception as e:
+            return f"❌ ERROR: {str(e)}"
+    
+    def enhance_prompt(self, text_prompt: str) -> str:
+        return self.generate(text_prompt, system_prompt=config.SYSTEM_PROMPT_ENHANCE, max_tokens=300, temperature=0.7)
+    
+    def describe_image(self, image_path: Path) -> str:
+        if not image_path.exists():
+            return f"❌ ERROR: Bild nicht gefunden"
+        return self.generate("Describe this image.", image_path=image_path, 
+                           system_prompt=config.SYSTEM_PROMPT_DESCRIBE, max_tokens=400, temperature=0.6)
+    
+    def multimodal_enhance(self, text_prompt: str, image_path: Path) -> str:
+        if not image_path.exists():
+            return f"❌ ERROR: Bild nicht gefunden"
+        return self.generate(f"Text: {text_prompt}", image_path=image_path,
+                           system_prompt=config.SYSTEM_PROMPT_DESCRIBE + " Combine both.",
+                           max_tokens=500, temperature=0.7)
