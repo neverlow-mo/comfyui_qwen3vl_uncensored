@@ -15,3 +15,24 @@ Thumbs.db
 
 # local backups we create while patching
 *.bak_*
+
+# Windows "Mark of the Web" (WSL copies)
+*:Zone.Identifier
+
+# accidental weird files / editor temp
+*~ 
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# backups / scratch
+*.bak*
+*.backup
+*.broken
+*.orig
+*.tmp
+
+# python cache
+__pycache__/
+*.pyc
