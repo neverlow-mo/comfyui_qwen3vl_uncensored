@@ -47,3 +47,11 @@ __pycache__/
 # python cache
 __pycache__/
 *.pyc
+
+# --- local patch artifacts ---
+*.bak
+*.backup
+*.broken
+*.Zone.Identifier
+__pycache__/
+*.pyc
