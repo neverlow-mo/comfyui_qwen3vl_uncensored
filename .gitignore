@@ -55,3 +55,11 @@ __pycache__/
 *.Zone.Identifier
 __pycache__/
 *.pyc
+
+# --- local patch artifacts ---
+*.bak
+*.backup
+*.broken
+*.Zone.Identifier
+__pycache__/
+*.pyc
